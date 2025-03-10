@@ -3,20 +3,18 @@ import numpy as np
 from tqdm import tqdm
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 import seaborn as sns
 import time
 
 # =========== Imports for ADASYN and LightGBM ==========
 from imblearn.over_sampling import ADASYN
-from lightgbm import LGBMClassifier
+from lightgbm import LGBMClassifier, early_stopping
 # ======================================================
 
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neural_network import MLPClassifier
 
 from sklearn.metrics import (
@@ -29,6 +27,7 @@ from sklearn.metrics import (
 )
 
 import warnings
+
 warnings.filterwarnings('ignore')
 
 # ----------------------------------------------------------------------------
@@ -44,11 +43,11 @@ for dirname, _, filenames in os.walk(cicddos2019_path):
         if filename.endswith('-training.parquet'):
             dfp = os.path.join(dirname, filename)
             dfps_train.append(dfp)
-            print(dfp)
+            print("Training File:", dfp)
         elif filename.endswith('-testing.parquet'):
             dfp = os.path.join(dirname, filename)
             dfps_test.append(dfp)
-            print(dfp)
+            print("Testing File:", dfp)
 
 train_prefixes = [os.path.basename(dfp).split('-')[0] for dfp in dfps_train]
 test_prefixes = [os.path.basename(dfp).split('-')[0] for dfp in dfps_test]
@@ -91,8 +90,48 @@ test_df["Label"] = test_df["Label"].map(label_mapping)
 print("\nUpdated Testing Data Label Distribution:")
 print(test_df["Label"].value_counts())
 
+
 # ----------------------------------------------------------------------------
-# 3) COLUMN ANALYSIS
+# 3) EXPLORATORY DATA ANALYSIS (EDA)
+# ----------------------------------------------------------------------------
+def perform_eda(df):
+    print("\n=== Exploratory Data Analysis ===")
+    # Display basic descriptive statistics
+    print("\nDescriptive Statistics:")
+    print(df.describe(include='all').transpose())
+
+    # Distribution of target variable
+    plt.figure(figsize=(8, 4))
+    sns.countplot(x="Label", data=df, palette='viridis')
+    plt.title("Class Distribution in Dataset")
+    plt.xlabel("Class Label")
+    plt.ylabel("Count")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+    # Histograms for numerical features
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    df[num_cols].hist(bins=20, figsize=(14, 10))
+    plt.suptitle("Histograms of Numerical Features")
+    plt.tight_layout()
+    plt.show()
+
+    # Correlation heatmap for numerical features
+    plt.figure(figsize=(12, 10))
+    corr_matrix = df[num_cols].corr()
+    sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap="coolwarm")
+    plt.title("Correlation Heatmap of Numerical Features")
+    plt.tight_layout()
+    plt.show()
+
+
+# Run EDA on training data
+perform_eda(train_df)
+
+
+# ----------------------------------------------------------------------------
+# 4) COLUMN ANALYSIS
 # ----------------------------------------------------------------------------
 def grab_col_names(data, cat_th=10, car_th=20):
     cat_cols = [col for col in data.columns if data[col].dtypes == "O"]
@@ -114,8 +153,9 @@ def grab_col_names(data, cat_th=10, car_th=20):
 
     return cat_cols, num_cols, high_card_cat_cols
 
+
 cat_cols, num_cols, high_card_cat_cols = grab_col_names(train_df)
-print(f"Catergorical Columns: {cat_cols}")
+print(f"Categorical Columns: {cat_cols}")
 print(f"Numerical Columns: {num_cols}")
 print(f"High Cardinality Categorical Columns: {high_card_cat_cols}")
 
@@ -132,38 +172,15 @@ print(f"Number of Duplicate Rows in train_df: {train_df.duplicated().sum()}")
 train_df = train_df.drop_duplicates()
 
 # ----------------------------------------------------------------------------
-# 4) OPTIONAL EDA
-# ----------------------------------------------------------------------------
-# plt.figure(figsize=(12, 6))
-# sns.boxplot(x="Label", y="Flow Duration", data=train_df)
-# plt.title("Flow Duration Distribution for DDoS vs Normal Traffic")
-# plt.show()
-#
-# plt.figure(figsize=(12, 6))
-# sns.boxplot(x="Protocol", y="Packet Length Mean", hue="Label", data=train_df)
-# plt.title("Packet Length Mean by Protocol and Attack Label")
-# plt.show()
-#
-# def my_headmap(data, size):
-#     if size:
-#         plt.figure(figsize=size)
-#     corr = data.corr()
-#     sns.heatmap(corr, annot=True, fmt=".1f", cmap="Blues", annot_kws={"size": 12})
-#     plt.title("Correlation Matrix")
-#     plt.show()
-#
-# numeric_cols = train_df.select_dtypes(include=[np.number]).columns
-# n_numeric_cols = len(numeric_cols)
-# my_headmap(train_df.select_dtypes(include=[np.number]), size=(n_numeric_cols + 1, n_numeric_cols + 1))
-
-# ----------------------------------------------------------------------------
 # 5) FEATURE SELECTION
 # ----------------------------------------------------------------------------
+# Remove non-informative single-value columns
 train_df.drop(single_unique, axis=1, inplace=True)
 test_df.drop(single_unique, axis=1, inplace=True)
 
 print("Shape after removing single-value columns:", train_df.shape, test_df.shape)
 
+# Remove highly correlated features
 numerical_df = train_df.select_dtypes(include=[np.number])
 corr_matrix = numerical_df.corr().abs()
 mask = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
@@ -200,7 +217,7 @@ label_map = {index: label for index, label in enumerate(le.classes_)}
 print("Label Map:", label_map)
 
 # ----------------------------------------------------------------------------
-# 8) VISUALIZE LABEL DISTRIBUTION BEFORE ADASYN
+# 8) OUTPUT CLASS DISTRIBUTION BEFORE ADASYN
 # ----------------------------------------------------------------------------
 unique_vals, counts_vals = np.unique(y_train, return_counts=True)
 plt.figure(figsize=(8, 4))
@@ -215,13 +232,29 @@ plt.show()
 
 print("\nBefore ADASYN Sampling - Class Distribution in y_train:")
 for u, c in zip(unique_vals, counts_vals):
-    print(f"Class {u} -> {label_map[u]}: {c} samples")
+    print(f"Class {u} ({label_map[u]}): {c} samples")
 
 # ----------------------------------------------------------------------------
 # 9) ADASYN FOR CLASS IMBALANCE
 # ----------------------------------------------------------------------------
 adasyn = ADASYN()
 X_train_res, y_train_res = adasyn.fit_resample(X_train, y_train)
+
+# Output class distribution AFTER ADASYN
+unique_after, counts_after = np.unique(y_train_res, return_counts=True)
+plt.figure(figsize=(8, 4))
+class_labels_after = [label_map[u] for u in unique_after]
+plt.bar(class_labels_after, counts_after, color='lightgreen')
+plt.title("Label Distribution AFTER ADASYN")
+plt.xlabel("Classes")
+plt.ylabel("Count")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+print("\nAfter ADASYN Sampling - Class Distribution in y_train_res:")
+for u, c in zip(unique_after, counts_after):
+    print(f"Class {u} ({label_map[u]}): {c} samples")
 
 # ----------------------------------------------------------------------------
 # 10) FEATURE SCALING
@@ -231,13 +264,20 @@ X_train_res_scaled = scaler.fit_transform(X_train_res)
 X_val_scaled = scaler.transform(X_val)
 X_test_scaled = scaler.transform(X_test)
 
+
 # ----------------------------------------------------------------------------
 # TRAIN & EVALUATE MODELS
 # ----------------------------------------------------------------------------
 def train_model(X_train, X_val, y_train, y_val):
     classifiers = {
         "Random Forest": RandomForestClassifier(),
-        "LightGBM": LGBMClassifier(n_estimators=100, learning_rate=0.1),
+        "LightGBM": LGBMClassifier(
+            n_estimators=500,
+            learning_rate=0.05,
+            num_leaves=31,
+            max_depth=7,
+            random_state=42
+        ),
         "MLP Classifier": MLPClassifier(hidden_layer_sizes=(30,), max_iter=100),
     }
 
@@ -248,7 +288,17 @@ def train_model(X_train, X_val, y_train, y_val):
         print(f"\nTraining {name}...")
 
         start_time = time.time()
-        model.fit(X_train, y_train)
+        if name == "LightGBM":
+            print("early stopping is here")
+            model.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                eval_metric='multi_logloss',
+                callbacks=[early_stopping(stopping_rounds=10, verbose=True)]
+            )
+        else:
+            model.fit(X_train, y_train)
         train_time = time.time() - start_time
 
         y_pred = model.predict(X_val)
@@ -262,12 +312,10 @@ def train_model(X_train, X_val, y_train, y_val):
 
         cv_score = np.mean(cross_val_score(model, X_train, y_train, cv=3))
 
-        # Plot ROC for each class
         for i in range(len(np.unique(y_val))):
             fpr, tpr, _ = roc_curve(y_val, y_proba[:, i], pos_label=i)
             plt.plot(fpr, tpr, label=f'{name} - Class {i} (AUC={roc_auc:.4f})')
 
-        # Record model metrics
         scores_list.append({
             "Model": name,
             "Training Time (s)": train_time,
@@ -288,11 +336,13 @@ def train_model(X_train, X_val, y_train, y_val):
 
     return pd.DataFrame(scores_list)
 
+
 scores = train_model(X_train_res_scaled, X_val_scaled, y_train_res, y_val)
 print("\nEvaluation Results:")
 print(scores[[
     "Model", "Training Time (s)", "Accuracy", "Precision", "Recall", "F1 Score", "ROC AUC", "CV Score"
 ]])
+
 
 def visualize_scores(df):
     metrics = ["Accuracy", "Precision", "Recall", "F1 Score"]
@@ -308,19 +358,20 @@ def visualize_scores(df):
     plt.tight_layout()
     plt.show()
 
+
 visualize_scores(scores)
 
+
 # ----------------------------------------------------------------------------
-# 11) SIMULATE REAL-TIME INFERENCE (No Confusion Matrix)
+# SIMULATE REAL-TIME INFERENCE (No Confusion Matrix)
 # ----------------------------------------------------------------------------
 def simulate_real_time_inference(model, X, y, label_map, interval=1.0, n_samples=10):
-    print(f"\n--- Simulating Real-Time Inference (LightGBM) with interval={interval}s for {n_samples} random samples ---")
+    print(
+        f"\n--- Simulating Real-Time Inference (LightGBM) with interval={interval}s for {n_samples} random samples ---")
     total_data = X.shape[0]
 
-    # Randomly select n_samples unique indices
     rand_indices = np.random.choice(total_data, n_samples, replace=False)
 
-    # Lists to store predictions and ground truth
     true_list = []
     pred_list = []
 
@@ -336,18 +387,33 @@ def simulate_real_time_inference(model, X, y, label_map, interval=1.0, n_samples
         print(f"Sample {i} (Index {idx}): True={true_label}, Pred={pred_class_label}")
         time.sleep(interval)
 
-    # Calculate simple accuracy for these random samples
     correct = sum(t == p for t, p in zip(true_list, pred_list))
-    accuracy = correct / n_samples
+    accuracy_rt = correct / n_samples
 
     print(f"\nReal-Time Simulation Summary ({n_samples} samples):")
     print(f"Correct Predictions: {correct}")
-    print(f"Accuracy: {accuracy:.2f}")
+    print(f"Accuracy: {accuracy_rt:.2f}")
     print("\n(No confusion matrix generated)")
 
+
+# ----------------------------------------------------------------------------
+# RETRAIN LIGHTGBM FOR REAL-TIME SIMULATION DEMO
+# ----------------------------------------------------------------------------
 print("\n--- Retraining LightGBM for Real-Time Simulation Demo ---")
-lgb_model = LGBMClassifier(n_estimators=100, learning_rate=0.1)
-lgb_model.fit(X_train_res_scaled, y_train_res)
+lgb_model = LGBMClassifier(
+    n_estimators=300,
+    learning_rate=0.1,
+    num_leaves=31,
+    max_depth=10,
+    random_state=42
+)
+lgb_model.fit(
+    X_train_res_scaled,
+    y_train_res,
+    eval_set=[(X_val_scaled, y_val)],
+    eval_metric='multi_logloss',
+    callbacks=[early_stopping(stopping_rounds=10, verbose=True)]
+)
 
 simulate_real_time_inference(
     model=lgb_model,
@@ -357,5 +423,31 @@ simulate_real_time_inference(
     interval=1.0,
     n_samples=100
 )
+
+# ----------------------------------------------------------------------------
+# OUTPUT FINAL DATA SUMMARY
+# ----------------------------------------------------------------------------
+print("\n--- DATA SUMMARY ---")
+print(f"Original Training Dataset: {train_df.shape[0]} rows, {train_df.shape[1]} fields")
+print(f"Original Test Dataset: {test_df.shape[0]} rows, {test_df.shape[1]} fields")
+
+print("\nLabel Distribution BEFORE ADASYN:")
+unique_vals, counts_vals = np.unique(y_train, return_counts=True)
+for u, c in zip(unique_vals, counts_vals):
+    print(f"Class {label_map[u]}: {c} samples")
+
+print("\nLabel Distribution AFTER ADASYN:")
+unique_after, counts_after = np.unique(y_train_res, return_counts=True)
+for u, c in zip(unique_after, counts_after):
+    print(f"Class {label_map[u]}: {c} samples")
+
+total_rows = train_df.shape[0] + test_df.shape[0]
+train_pct = len(X_train) / total_rows * 100
+val_pct = len(X_val) / total_rows * 100
+test_pct = test_df.shape[0] / total_rows * 100
+print("\nSplit Percentages (of entire dataset):")
+print(f"Training set: {train_pct:.2f}%")
+print(f"Validation set: {val_pct:.2f}%")
+print(f"Test set: {test_pct:.2f}%")
 
 print("\n--- END OF SCRIPT ---")
