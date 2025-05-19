@@ -30,14 +30,6 @@ ddos-detection-model/
 ## Requirements
 
 * Python 3.7+
-* numpy
-* pandas
-* tqdm
-* imbalanced-learn
-* lightgbm
-* scikit-learn
-* matplotlib
-* seaborn
 
 Install dependencies:
 
